@@ -1,110 +1,12 @@
-import {ItemView, Notice, Plugin, TFile, WorkspaceLeaf} from "obsidian";
-import {extractFrontmatter} from "fey-script";
-
-const VIEW_TYPE = "my-custom-view";
-
-function openFullscreen(elem: HTMLElement) {
-	if (elem.requestFullscreen) {
-		elem.requestFullscreen();
-	} else if ((elem as any).webkitRequestFullscreen) {
-		(elem as any).webkitRequestFullscreen();
-	} else if ((elem as any).msRequestFullscreen) {
-		(elem as any).msRequestFullscreen();
-	}
-}
-
-class MyCustomView extends ItemView {
-	file: TFile | null = null;
-
-	constructor(leaf: WorkspaceLeaf) {
-		super(leaf);
-
-		this.contentEl.addEventListener('wheel', (e) => {
-			this.scrollPosition = this.contentEl.scrollTop;
-			console.log('Saving:', this.scrollPosition);
-		});
-	}
-
-	getViewType() {
-		return VIEW_TYPE;
-	}
-
-	getDisplayText() {
-		return "Live Preview";
-	}
-
-	async onOpen() {
-		await this.render();
-	}
-
-	prepareFeyScriptCode(code, title) {
-		code = code.replaceAll(/\!\[\[([\s\S]+?)\]\]/g, (match, fileName) => {
-			const [url, params] = fileName.split('?');
-			const file = this.app.metadataCache.getFirstLinkpathDest(url, "");
-
-			if (file) {
-				const src = this.app.vault.getResourcePath(file);
-				return `\n![](${src}&${params})\n`
-			}
-
-			return '';
-		});
-		const frontMatter = /^\n*---\n([\s\S]*?)\n---/g.exec(code);
-		code = code.replaceAll(/^\n*---\n([\s\S]*?)\n---/g, '')
-		return `${frontMatter || ''}# ${title}\n ${code}`;
-	}
-
-	async setFile(file: TFile | null) {
-		this.file = file;
-		await this.render();
-	}
-
-	async render() {
-		this.contentEl.empty();
-		if (!this.file) return;
-
-		try {
-			let content = await this.app.vault.read(this.file);
-			const title = this.file.basename;
-			const {frontMatterData, cleanMDX} = extractFrontmatter(content);
-			content = this.prepareFeyScriptCode(cleanMDX, title);
-			const viewer = document.createElement('fey-viewer');
-			viewer.setData(frontMatterData);
-			viewer.resolveImports = async (path) => {
-				const file = this.app.metadataCache.getFirstLinkpathDest(path, "");
-				if (file instanceof TFile) {
-					const content = await this.app.vault.read(file);
-					return this.prepareFeyScriptCode(content, file.basename)
-				}
-				return null;
-			}
-			viewer.innerHTML = content;
-			this.contentEl.appendChild(viewer);
-			this.contentEl.addEventListener("dblclick", (event) => {
-				const target = event.target as HTMLElement;
-
-				if (target.tagName === "IMG") {
-					const img = target as HTMLImageElement;
-					openFullscreen(img);
-				}
-			});
-
-			setTimeout(() => {
-				console.log('Scrolling to:', this.scrollPosition);
-				this.contentEl.scroll(0, this.scrollPosition);
-				viewer.classList.add('done');
-			}, 200);
-		} catch (err) {
-			console.error("Error rendering preview:", err);
-		}
-	}
-}
+import {Notice, Plugin, TFile, WorkspaceLeaf, MarkdownView, Editor, Menu} from "obsidian";
+import {FEY_SCRIPT_VIEW, FeyScriptPreviewView} from "./views/FeyScriptPreviewView";
+import {FileSuggestModal} from "./modals/FileSuggestModal";
 
 export default class LivePreviewPlugin extends Plugin {
 	private activeFile;
 
 	async onload() {
-		this.registerView(VIEW_TYPE, leaf => new MyCustomView(leaf));
+		this.registerView(FEY_SCRIPT_VIEW, leaf => new FeyScriptPreviewView(leaf));
 
 		// When the active file changes, update preview (if it exists)
 		this.registerEvent(this.app.workspace.on("file-open", (file) => {
@@ -116,24 +18,24 @@ export default class LivePreviewPlugin extends Plugin {
 			this.activeFile = this.app.workspace.getActiveFile();
 			const leaf = this.getExistingPreviewLeaf();
 			if (leaf) {
-				(leaf.view as MyCustomView).setFile(file);
+				(leaf.view as FeyScriptPreviewView).setFile(file);
 			}
 		}));
 
 		// Optional: update view when saved
 		this.registerEvent(this.app.vault.on("modify", (file) => {
 			const leaf = this.getExistingPreviewLeaf();
-			if (leaf && (leaf.view as MyCustomView).file === file) {
-				(leaf.view as MyCustomView).render();
+			if (leaf && (leaf.view as FeyScriptPreviewView).file === file) {
+				(leaf.view as FeyScriptPreviewView).render();
 			}
 		}));
 
 		this.addRibbonIcon('dice', 'Fey-Script', async () => {
 			const leaf = this.app.workspace.getLeaf(true);
-			await leaf.setViewState({ type: VIEW_TYPE, active: false });
+			await leaf.setViewState({ type: FEY_SCRIPT_VIEW, active: false });
 			this.app.workspace.revealLeaf(leaf);
 			const view = leaf.view;
-			if (view instanceof MyCustomView) {
+			if (view instanceof FeyScriptPreviewView) {
 				view.setFile(this.activeFile);
 			} else {
 				console.warn("View not ready or not MyCustomView:", view);
@@ -292,13 +194,64 @@ export default class LivePreviewPlugin extends Plugin {
 
 			new Notice(`${randomElement(words)}, ${randomElement(words)}, ${randomElement(words)}`, 10000);
 		});
+
+		this.registerEvent(
+			this.app.workspace.on("editor-change", (editor: Editor, view: MarkdownView) => {
+				const cursor = editor.getCursor();
+				const line = editor.getLine(cursor.line);
+				const match = line.substring(0, cursor.ch).match(/\[\[>\s?([^\]]*)$/);
+
+				if (match) {
+					const query = match[1];
+					new FileSuggestModal(this.app, query, (selectedPath) => {
+						const from = {
+							line: cursor.line,
+							ch: cursor.ch - match[0].length,
+						};
+						const nextText = editor.getRange(cursor, { line: cursor.line, ch: cursor.ch + 2 });
+						const endsWithClosing = nextText === ']]';
+
+						const to = endsWithClosing
+							? { line: cursor.line, ch: cursor.ch + 2 }
+							: cursor;
+						editor.replaceRange(`[[> ${selectedPath}]]`, from, to);
+					}).open();
+				}
+			})
+		);
+
+		this.registerEvent(
+			this.app.workspace.on('file-menu', (menu: Menu, file: TFile, source: string) => {
+				menu.addItem((item) => {
+					item.setTitle('Create Special Note');
+					item.setIcon('document');
+					item.onClick(async () => {
+						const folder = file.parent;
+						if(!folder) return;
+						const name = "new-file.yml.md";
+						const path = folder.path + "/" + name;
+
+						if (!this.app.vault.getAbstractFileByPath(path)) {
+							await this.app.vault.create(path, "key: value\nanother: thing");
+							new Notice(`Created ${name}`);
+						} else {
+							new Notice(`${name} already exists`);
+						}
+					});
+				});
+			})
+		);
 	}
 
+
+
 	onunload() {
-		this.app.workspace.detachLeavesOfType(VIEW_TYPE);
+		this.app.workspace.detachLeavesOfType(FEY_SCRIPT_VIEW);
 	}
 
 	getExistingPreviewLeaf(): WorkspaceLeaf | null {
-		return this.app.workspace.getLeavesOfType(VIEW_TYPE)[0] || null;
+		return this.app.workspace.getLeavesOfType(FEY_SCRIPT_VIEW)[0] || null;
 	}
 }
+
+
